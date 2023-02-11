@@ -78,9 +78,9 @@ func (c *QQClient) buildLoginExtraPacket() (uint16, []byte) {
 			TerminalType: proto.Uint32(2),
 			Status:       proto.Uint32(10),
 			LoginTime:    proto.Uint32(5),
-			HardwareInfo: proto.String(string(c.deviceInfo.Model)),
-			SoftwareInfo: proto.String(string(c.deviceInfo.Version.Release)),
-			Guid:         c.deviceInfo.Guid,
+			HardwareInfo: proto.String(string(c.device.Model)),
+			SoftwareInfo: proto.String(string(c.device.Version.Release)),
+			Guid:         c.device.Guid,
 			AppName:      proto.Some(c.version.ApkId),
 			SubAppId:     proto.Some(c.version.AppId),
 		},
@@ -155,7 +155,7 @@ func (c *QQClient) bigDataRequest(subCmd uint32, req proto.Message) ([]byte, err
 	return tea.Decrypt(payload), nil
 }
 
-func decodeLoginExtraResponse(c *QQClient, _ *network.IncomingPacketInfo, payload []byte) (any, error) {
+func decodeLoginExtraResponse(c *QQClient, _ *network.Packet, payload []byte) (any, error) {
 	rsp := cmd0x3f6.C3F6RspBody{}
 	if err := proto.Unmarshal(payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
@@ -171,7 +171,7 @@ func decodeLoginExtraResponse(c *QQClient, _ *network.IncomingPacketInfo, payloa
 	return nil, nil
 }
 
-func decodeConnKeyResponse(c *QQClient, _ *network.IncomingPacketInfo, payload []byte) (any, error) {
+func decodeConnKeyResponse(c *QQClient, _ *network.Packet, payload []byte) (any, error) {
 	rsp := cmd0x6ff.C501RspBody{}
 	if err := proto.Unmarshal(payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")

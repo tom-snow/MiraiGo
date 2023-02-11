@@ -51,7 +51,7 @@ func (c *QQClient) buildMultiApplyUpPacket(data, hash []byte, buType int32, grou
 }
 
 // MultiMsg.ApplyUp
-func decodeMultiApplyUpResponse(_ *QQClient, _ *network.IncomingPacketInfo, payload []byte) (any, error) {
+func decodeMultiApplyUpResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
 	body := multimsg.MultiRspBody{}
 	if err := proto.Unmarshal(payload, &body); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
@@ -91,21 +91,29 @@ func (c *QQClient) buildMultiApplyDownPacket(resID string) (uint16, []byte) {
 }
 
 // MultiMsg.ApplyDown
-func decodeMultiApplyDownResponse(_ *QQClient, _ *network.IncomingPacketInfo, payload []byte) (any, error) {
+func decodeMultiApplyDownResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
 	body := multimsg.MultiRspBody{}
 	if err := proto.Unmarshal(payload, &body); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if len(body.MultimsgApplydownRsp) == 0 {
-		return nil, errors.New("not found")
+		return nil, errors.New("message not found")
 	}
 	rsp := body.MultimsgApplydownRsp[0]
+
+	if rsp.ThumbDownPara == nil {
+		return nil, errors.New("message not found")
+	}
 
 	var prefix string
 	if rsp.MsgExternInfo != nil && rsp.MsgExternInfo.ChannelType == 2 {
 		prefix = "https://ssl.htdata.qq.com"
 	} else {
-		prefix = fmt.Sprintf("http://%s:%d", binary.UInt32ToIPV4Address(uint32(rsp.Uint32DownIp[0])), body.MultimsgApplydownRsp[0].Uint32DownPort[0])
+		ma := body.MultimsgApplydownRsp[0]
+		if len(rsp.Uint32DownIp) == 0 || len(ma.Uint32DownPort) == 0 {
+			return nil, errors.New("message not found")
+		}
+		prefix = fmt.Sprintf("http://%s:%d", binary.UInt32ToIPV4Address(uint32(rsp.Uint32DownIp[0])), ma.Uint32DownPort[0])
 	}
 	b, err := utils.HttpGetBytes(fmt.Sprintf("%s%s", prefix, string(rsp.ThumbDownPara)), "")
 	if err != nil {

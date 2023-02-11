@@ -1,8 +1,9 @@
 package network
 
-type IncomingPacketInfo struct {
-	CommandName string
+type Packet struct {
 	SequenceId  uint16
+	CommandName string
+	Payload     []byte
 	Params      RequestParams
 }
 
