@@ -43,10 +43,10 @@ type imageUploadResponse struct {
 	IsExists      bool
 }
 
-func (c *QQClient) UploadImage(target message.Source, img io.ReadSeeker, thread ...int) (message.IMessageElement, error) {
+func (c *QQClient) UploadImage(target message.Source, img io.ReadSeeker) (message.IMessageElement, error) {
 	switch target.SourceType {
 	case message.SourceGroup, message.SourceGuildChannel, message.SourceGuildDirect:
-		return c.uploadGroupOrGuildImage(target, img, thread...)
+		return c.uploadGroupOrGuildImage(target, img)
 	case message.SourcePrivate:
 		return c.uploadPrivateImage(target.PrimaryID, img, 0)
 	default:
@@ -54,7 +54,7 @@ func (c *QQClient) UploadImage(target message.Source, img io.ReadSeeker, thread 
 	}
 }
 
-func (c *QQClient) uploadGroupOrGuildImage(target message.Source, img io.ReadSeeker, thread ...int) (message.IMessageElement, error) {
+func (c *QQClient) uploadGroupOrGuildImage(target message.Source, img io.ReadSeeker) (message.IMessageElement, error) {
 	_, _ = img.Seek(0, io.SeekStart) // safe
 	fh, length := utils.ComputeMd5AndLength(img)
 	_, _ = img.Seek(0, io.SeekStart)
@@ -63,10 +63,6 @@ func (c *QQClient) uploadGroupOrGuildImage(target message.Source, img io.ReadSee
 	imgWaiter.Wait(key)
 	defer imgWaiter.Done(key)
 
-	tc := 1
-	if len(thread) > 0 {
-		tc = thread[0]
-	}
 	cmd := int32(2)
 	ext := EmptyBytes
 	if target.SourceType != message.SourceGroup { // guild
@@ -112,11 +108,7 @@ func (c *QQClient) uploadGroupOrGuildImage(target message.Source, img io.ReadSee
 		Ticket:    rsp.UploadKey,
 		Ext:       ext,
 	}
-	if tc > 1 && length > 3*1024*1024 {
-		_, err = c.highwaySession.UploadBDHMultiThread(input)
-	} else {
-		_, err = c.highwaySession.UploadBDH(input)
-	}
+	_, err = c.highwaySession.Upload(input)
 	if err != nil {
 		return nil, errors.Wrap(err, "upload failed")
 	}
@@ -306,7 +298,7 @@ func (c *QQClient) uploadOcrImage(img io.Reader, size int32, sum []byte) (string
 		Uuid:       binary.GenUUID(r),
 	})
 
-	rsp, err := c.highwaySession.UploadBDH(highway.Transaction{
+	rsp, err := c.highwaySession.Upload(highway.Transaction{
 		CommandID: 76,
 		Body:      img,
 		Size:      int64(size),
@@ -345,9 +337,9 @@ func (c *QQClient) buildImageOcrRequestPacket(url, md5 string, size, weight, hei
 }
 
 // ImgStore.GroupPicUp
-func decodeGroupImageStoreResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeGroupImageStoreResponse(_ *QQClient, packet *network.Packet) (any, error) {
 	pkt := cmd0x388.D388RspBody{}
-	err := proto.Unmarshal(payload, &pkt)
+	err := proto.Unmarshal(packet.Payload, &pkt)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
@@ -372,24 +364,24 @@ func decodeGroupImageStoreResponse(_ *QQClient, _ *network.Packet, payload []byt
 	}, nil
 }
 
-func decodeGroupImageDownloadResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
-	pkt := cmd0x388.D388RspBody{}
-	if err := proto.Unmarshal(payload, &pkt); err != nil {
+func decodeGroupImageDownloadResponse(_ *QQClient, pkt *network.Packet) (any, error) {
+	rsp := cmd0x388.D388RspBody{}
+	if err := proto.Unmarshal(pkt.Payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "unmarshal protobuf message error")
 	}
-	if len(pkt.GetimgUrlRsp) == 0 {
+	if len(rsp.GetimgUrlRsp) == 0 {
 		return nil, errors.New("response not found")
 	}
-	if len(pkt.GetimgUrlRsp[0].FailMsg) != 0 {
-		return nil, errors.New(utils.B2S(pkt.GetimgUrlRsp[0].FailMsg))
+	if len(rsp.GetimgUrlRsp[0].FailMsg) != 0 {
+		return nil, errors.New(utils.B2S(rsp.GetimgUrlRsp[0].FailMsg))
 	}
-	return fmt.Sprintf("https://%s%s", pkt.GetimgUrlRsp[0].DownDomain, pkt.GetimgUrlRsp[0].BigDownPara), nil
+	return fmt.Sprintf("https://%s%s", rsp.GetimgUrlRsp[0].DownDomain, rsp.GetimgUrlRsp[0].BigDownPara), nil
 }
 
 // OidbSvc.0xe07_0
-func decodeImageOcrResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeImageOcrResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	rsp := oidb.DE07RspBody{}
-	err := unpackOIDBPackage(payload, &rsp)
+	err := unpackOIDBPackage(pkt.Payload, &rsp)
 	if err != nil {
 		return nil, err
 	}

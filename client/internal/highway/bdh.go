@@ -3,10 +3,8 @@ package highway
 import (
 	"crypto/md5"
 	"io"
-	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -27,60 +25,28 @@ type Transaction struct {
 }
 
 func (bdh *Transaction) encrypt(key []byte) error {
-	if bdh.Encrypt {
-		if len(key) == 0 {
-			return errors.New("session key not found. maybe miss some packet?")
-		}
-		bdh.Ext = binary.NewTeaCipher(key).Encrypt(bdh.Ext)
+	if !bdh.Encrypt {
+		return nil
 	}
+	if len(key) == 0 {
+		return errors.New("session key not found. maybe miss some packet?")
+	}
+	bdh.Ext = binary.NewTeaCipher(key).Encrypt(bdh.Ext)
 	return nil
 }
 
-func (s *Session) retry(upload func(s *Session, addr Addr, trans *Transaction) ([]byte, error), trans *Transaction) ([]byte, error) {
-	// try to find a available server
-	for _, addr := range s.SsoAddr {
-		r, err := upload(s, addr, trans)
-		if err == nil {
-			return r, nil
-		}
-		if _, ok := err.(net.Error); ok {
-			// try another server
-			// TODO: delete broken servers?
-			continue
-		}
-		return nil, err
-	}
-	return nil, errors.New("cannot found available server")
-}
-
-func (s *Session) UploadBDH(trans Transaction) ([]byte, error) {
-	// encrypt ext data
-	if err := trans.encrypt(s.SessionKey); err != nil {
-		return nil, err
-	}
-	return s.retry(uploadBDH, &trans)
-}
-
-func uploadBDH(s *Session, addr Addr, trans *Transaction) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", addr.String(), time.Second*20)
+func (s *Session) uploadSingle(trans Transaction) ([]byte, error) {
+	pc, err := s.selectConn()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer s.putIdleConn(pc)
 
-	reader := binary.NewNetworkReader(conn)
-	if err = s.sendEcho(conn); err != nil {
-		return nil, err
-	}
-
-	const chunkSize = 256 * 1024
-	var rspExt, chunk []byte
+	reader := binary.NewNetworkReader(pc.conn)
+	const chunkSize = 128 * 1024
+	var rspExt []byte
 	offset := 0
-	if trans.Size > chunkSize {
-		chunk = make([]byte, chunkSize)
-	} else {
-		chunk = make([]byte, trans.Size)
-	}
+	chunk := make([]byte, chunkSize)
 	for {
 		chunk = chunk[:cap(chunk)]
 		rl, err := io.ReadFull(trans.Body, chunk)
@@ -92,7 +58,16 @@ func uploadBDH(s *Session, addr Addr, trans *Transaction) ([]byte, error) {
 		}
 		ch := md5.Sum(chunk)
 		head, _ := proto.Marshal(&pb.ReqDataHighwayHead{
-			MsgBasehead: s.dataHighwayHead(_REQ_CMD_DATA, 4096, trans.CommandID, 2052),
+			MsgBasehead: &pb.DataHighwayHead{
+				Version:   1,
+				Uin:       s.Uin,
+				Command:   _REQ_CMD_DATA,
+				Seq:       s.nextSeq(),
+				Appid:     s.AppID,
+				Dataflag:  4096,
+				CommandId: trans.CommandID,
+				LocaleId:  2052,
+			},
 			MsgSeghead: &pb.SegHead{
 				Filesize:      trans.Size,
 				Dataoffset:    int64(offset),
@@ -104,12 +79,12 @@ func uploadBDH(s *Session, addr Addr, trans *Transaction) ([]byte, error) {
 			ReqExtendinfo: trans.Ext,
 		})
 		offset += rl
-		frame := newFrame(head, chunk)
-		_, err = frame.WriteTo(conn)
+		buffers := frame(head, chunk)
+		_, err = buffers.WriteTo(pc.conn)
 		if err != nil {
 			return nil, errors.Wrap(err, "write conn error")
 		}
-		rspHead, _, err := readResponse(reader)
+		rspHead, err := readResponse(reader)
 		if err != nil {
 			return nil, errors.Wrap(err, "highway upload error")
 		}
@@ -126,23 +101,32 @@ func uploadBDH(s *Session, addr Addr, trans *Transaction) ([]byte, error) {
 	return rspExt, nil
 }
 
-func (s *Session) UploadBDHMultiThread(trans Transaction) ([]byte, error) {
-	// for small file and small thread count,
-	// use UploadBDH instead of UploadBDHMultiThread
-	if trans.Size < 1024*1024*3 {
-		return s.UploadBDH(trans)
-	}
-
+func (s *Session) Upload(trans Transaction) ([]byte, error) {
 	// encrypt ext data
 	if err := trans.encrypt(s.SessionKey); err != nil {
 		return nil, err
 	}
-	return s.retry(uploadBDHMultiThread, &trans)
-}
 
-func uploadBDHMultiThread(s *Session, addr Addr, trans *Transaction) ([]byte, error) {
+	const maxThreadCount = 4
+	threadCount := int(trans.Size) / (3 * 512 * 1024) // 1 thread upload 1.5 MB
+	if threadCount > maxThreadCount {
+		threadCount = maxThreadCount
+	}
+	if threadCount < 2 {
+		// single thread upload
+		return s.uploadSingle(trans)
+	}
+
+	// pick a address
+	// TODO: pick smarter
+	pc, err := s.selectConn()
+	if err != nil {
+		return nil, err
+	}
+	addr := pc.addr
+	s.putIdleConn(pc)
+
 	const blockSize int64 = 256 * 1024
-	const threadCount = 4
 	var (
 		rspExt          []byte
 		completedThread uint32
@@ -158,23 +142,22 @@ func uploadBDHMultiThread(s *Session, addr Addr, trans *Transaction) ([]byte, er
 			cond.Signal()
 		}()
 
-		conn, err := net.DialTimeout("tcp", addr.String(), time.Second*20)
+		// todo: get from pool?
+		pc, err := s.connect(addr)
 		if err != nil {
 			return err
 		}
-		defer conn.Close()
-		reader := binary.NewNetworkReader(conn)
-		if err = s.sendEcho(conn); err != nil {
-			return err
-		}
+		defer s.putIdleConn(pc)
 
+		reader := binary.NewNetworkReader(pc.conn)
 		chunk := make([]byte, blockSize)
 		for {
 			cond.L.Lock() // lock protect reading
 			off := offset
 			offset += blockSize
 			id++
-			if int64(id) == count { // last
+			last := int64(id) == count
+			if last { // last
 				for atomic.LoadUint32(&completedThread) != uint32(threadCount-1) {
 					cond.Wait()
 				}
@@ -194,7 +177,16 @@ func uploadBDHMultiThread(s *Session, addr Addr, trans *Transaction) ([]byte, er
 			}
 			ch := md5.Sum(chunk)
 			head, _ := proto.Marshal(&pb.ReqDataHighwayHead{
-				MsgBasehead: s.dataHighwayHead(_REQ_CMD_DATA, 4096, trans.CommandID, 2052),
+				MsgBasehead: &pb.DataHighwayHead{
+					Version:   1,
+					Uin:       s.Uin,
+					Command:   _REQ_CMD_DATA,
+					Seq:       s.nextSeq(),
+					Appid:     s.AppID,
+					Dataflag:  4096,
+					CommandId: trans.CommandID,
+					LocaleId:  2052,
+				},
 				MsgSeghead: &pb.SegHead{
 					Filesize:      trans.Size,
 					Dataoffset:    off,
@@ -205,19 +197,19 @@ func uploadBDHMultiThread(s *Session, addr Addr, trans *Transaction) ([]byte, er
 				},
 				ReqExtendinfo: trans.Ext,
 			})
-			frame := newFrame(head, chunk)
-			_, err = frame.WriteTo(conn)
+			buffers := frame(head, chunk)
+			_, err = buffers.WriteTo(pc.conn)
 			if err != nil {
 				return errors.Wrap(err, "write conn error")
 			}
-			rspHead, _, err := readResponse(reader)
+			rspHead, err := readResponse(reader)
 			if err != nil {
 				return errors.Wrap(err, "highway upload error")
 			}
 			if rspHead.ErrorCode != 0 {
 				return errors.Errorf("upload failed: %d", rspHead.ErrorCode)
 			}
-			if rspHead.RspExtendinfo != nil {
+			if last && rspHead.RspExtendinfo != nil {
 				rspExt = rspHead.RspExtendinfo
 			}
 		}

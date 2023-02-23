@@ -2,9 +2,9 @@ package auth
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"math/rand"
 
 	"github.com/pkg/errors"
 
@@ -137,8 +137,16 @@ func (info *Device) ReadJson(d []byte) error {
 	case 1, 2, 3, 4, 5, 6:
 		info.Protocol = Protocol(f.Protocol)
 	default:
-		info.Protocol = IPad
+		info.Protocol = AndroidPad
 	}
+
+	v := new(OSVersion)
+	v.SDK = f.Version.Sdk
+	v.Release = []byte(f.Version.Release)
+	v.CodeName = []byte(f.Version.Codename)
+	v.Incremental = []byte(f.Version.Incremental)
+	info.Version = v
+
 	info.GenNewGuid()
 	info.GenNewTgtgtKey()
 	return nil

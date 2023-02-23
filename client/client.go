@@ -4,7 +4,6 @@ import (
 	"crypto/md5"
 	"fmt"
 	"math/rand"
-	"net"
 	"net/netip"
 	"sort"
 	"strconv"
@@ -62,11 +61,10 @@ type QQClient struct {
 	// internal state
 	handlers        syncx.Map[uint16, *handlerInfo]
 	waiters         syncx.Map[string, func(any, error)]
+	initServerOnce  sync.Once
 	servers         []netip.AddrPort
 	currServerIndex int
 	retryTimes      int
-	version         *auth.AppVersion
-	device          *auth.Device
 	alive           bool
 
 	// session info
@@ -147,7 +145,7 @@ func (h *handlerInfo) getParams() network.RequestParams {
 	return h.params
 }
 
-var decoders = map[string]func(*QQClient, *network.Packet, []byte) (any, error){
+var decoders = map[string]func(*QQClient, *network.Packet) (any, error){
 	"wtlogin.login":                                decodeLoginResponse,
 	"wtlogin.exchange_emp":                         decodeExchangeEmpResponse,
 	"wtlogin.trans_emp":                            decodeTransEmpResponse,
@@ -197,16 +195,9 @@ func NewClientMd5(uin int64, passwordMd5 [16]byte) *QQClient {
 		onlinePushCache: utils.NewCache[unit](time.Second * 15),
 		alive:           true,
 		highwaySession:  new(highway.Session),
-
-		version: new(auth.AppVersion),
-		device:  new(auth.Device),
 	}
 
-	cli.transport = &network.Transport{
-		Sig:     cli.sig,
-		Version: cli.version,
-		Device:  cli.device,
-	}
+	cli.transport = &network.Transport{Sig: cli.sig}
 	cli.oicq = oicq.NewCodec(cli.Uin)
 	{ // init atomic values
 		cli.SequenceId.Store(0x3635)
@@ -217,63 +208,23 @@ func NewClientMd5(uin int64, passwordMd5 [16]byte) *QQClient {
 	}
 	cli.highwaySession.Uin = strconv.FormatInt(cli.Uin, 10)
 	cli.GuildService = &GuildService{c: cli}
-	cli.UseDevice(SystemDeviceInfo)
-	sso, err := getSSOAddress()
-	if err == nil && len(sso) > 0 {
-		cli.servers = append(sso, cli.servers...)
-	}
-	adds, err := net.LookupIP("msfwifi.3g.qq.com") // host servers
-	if err == nil && len(adds) > 0 {
-		var hostAddrs []netip.AddrPort
-		for _, addr := range adds {
-			ip, ok := netip.AddrFromSlice(addr.To4())
-			if ok {
-				hostAddrs = append(hostAddrs, netip.AddrPortFrom(ip, 8080))
-			}
-		}
-		cli.servers = append(hostAddrs, cli.servers...)
-	}
-	if len(cli.servers) == 0 {
-		cli.servers = []netip.AddrPort{ // default servers
-			netip.AddrPortFrom(netip.AddrFrom4([4]byte{42, 81, 172, 81}), 80),
-			netip.AddrPortFrom(netip.AddrFrom4([4]byte{114, 221, 148, 59}), 14000),
-			netip.AddrPortFrom(netip.AddrFrom4([4]byte{42, 81, 172, 147}), 443),
-			netip.AddrPortFrom(netip.AddrFrom4([4]byte{125, 94, 60, 146}), 80),
-			netip.AddrPortFrom(netip.AddrFrom4([4]byte{114, 221, 144, 215}), 80),
-			netip.AddrPortFrom(netip.AddrFrom4([4]byte{42, 81, 172, 22}), 80),
-		}
-	}
-	pings := make([]int64, len(cli.servers))
-	wg := sync.WaitGroup{}
-	wg.Add(len(cli.servers))
-	// println(len(cli.servers))
-	for i := range cli.servers {
-		go func(index int) {
-			defer wg.Done()
-			p, err := qualityTest(cli.servers[index].String())
-			if err != nil {
-				pings[index] = 9999
-				return
-			}
-			pings[index] = p
-		}(i)
-	}
-	wg.Wait()
-	sort.Slice(cli.servers, func(i, j int) bool {
-		return pings[i] < pings[j]
-	})
-	if len(cli.servers) > 3 {
-		cli.servers = cli.servers[0 : len(cli.servers)/2] // 保留ping值中位数以上的server
-	}
 	cli.TCP.PlannedDisconnect(cli.plannedDisconnect)
 	cli.TCP.UnexpectedDisconnect(cli.unexpectedDisconnect)
 	return cli
 }
 
+func (c *QQClient) version() *auth.AppVersion {
+	return c.transport.Version
+}
+
+func (c *QQClient) Device() *DeviceInfo {
+	return c.transport.Device
+}
+
 func (c *QQClient) UseDevice(info *auth.Device) {
-	*c.version = *info.Protocol.Version()
-	*c.device = *info
-	c.highwaySession.AppID = int32(c.version.AppId)
+	c.transport.Version = info.Protocol.Version()
+	c.transport.Device = info
+	c.highwaySession.AppID = int32(c.version().AppId)
 	c.sig.Ksid = []byte(fmt.Sprintf("|%s|A8.2.7.27f6ea96", info.IMEI))
 }
 
@@ -325,7 +276,7 @@ func (c *QQClient) TokenLogin(token []byte) error {
 		c.oicq.WtSessionTicketKey = r.ReadBytesShort()
 		c.sig.OutPacketSessionID = r.ReadBytesShort()
 		// SystemDeviceInfo.TgtgtKey = r.ReadBytesShort()
-		c.device.TgtgtKey = r.ReadBytesShort()
+		c.Device().TgtgtKey = r.ReadBytesShort()
 	}
 	_, err = c.sendAndWait(c.buildRequestChangeSigPacket(true))
 	if err != nil {
@@ -455,7 +406,7 @@ func (c *QQClient) init(tokenLogin bool) error {
 		go c.doHeartbeat()
 	}
 	_ = c.RefreshStatus()
-	if c.version.Protocol == auth.QiDian {
+	if c.version().Protocol == auth.QiDian {
 		_, _ = c.sendAndWait(c.buildLoginExtraPacket())     // 小登录
 		_, _ = c.sendAndWait(c.buildConnKeyRequestPacket()) // big data key 如果等待 config push 的话时间来不及
 	}
@@ -476,7 +427,7 @@ func (c *QQClient) GenToken() []byte {
 		w.WriteBytesShort(c.sig.EncryptedA1)
 		w.WriteBytesShort(c.oicq.WtSessionTicketKey)
 		w.WriteBytesShort(c.sig.OutPacketSessionID)
-		w.WriteBytesShort(c.device.TgtgtKey)
+		w.WriteBytesShort(c.Device().TgtgtKey)
 	})
 }
 
@@ -525,7 +476,7 @@ func (c *QQClient) ReloadFriendList() error {
 // 当使用普通QQ时: 请求好友列表
 // 当使用企点QQ时: 请求外部联系人列表
 func (c *QQClient) GetFriendList() (*FriendListResponse, error) {
-	if c.version.Protocol == auth.QiDian {
+	if c.version().Protocol == auth.QiDian {
 		rsp, err := c.getQiDianAddressDetailList()
 		if err != nil {
 			return nil, err

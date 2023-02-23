@@ -2,7 +2,6 @@ package network
 
 import (
 	"strconv"
-	"sync"
 
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/client/internal/auth"
@@ -10,10 +9,9 @@ import (
 
 // Transport is a network transport.
 type Transport struct {
-	sessionMu sync.Mutex
-	Sig       *auth.SigInfo
-	Version   *auth.AppVersion
-	Device    *auth.Device
+	Sig     *auth.SigInfo
+	Version *auth.AppVersion
+	Device  *auth.Device
 
 	// connection
 	// conn *TCPClient
@@ -38,7 +36,7 @@ func (t *Transport) packBody(req *Request, w *binary.Writer) {
 	w.WriteUInt32(uint32(len(t.Sig.OutPacketSessionID) + 4))
 	w.Write(t.Sig.OutPacketSessionID)
 	if req.Type == RequestTypeLogin {
-		w.WriteString(t.Device.IMEI)
+		w.WriteString((*t.Device).IMEI)
 		w.WriteUInt32(0x04)
 
 		w.WriteUInt16(uint16(len(t.Sig.Ksid)) + 2)

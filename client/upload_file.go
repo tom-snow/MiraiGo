@@ -105,7 +105,7 @@ func (c *QQClient) UploadFile(target message.Source, file *LocalFile) error {
 				},
 				ClientInfo: &exciting.ExcitingClientInfo{
 					ClientType:   proto.Int32(2),
-					AppId:        proto.String(fmt.Sprint(c.version.AppId)),
+					AppId:        proto.String(fmt.Sprint(c.version().AppId)),
 					TerminalType: proto.Int32(2),
 					ClientVer:    proto.String("d92615c5"),
 					Unknown:      proto.Int32(4),
@@ -147,7 +147,7 @@ func (c *QQClient) UploadFile(target message.Source, file *LocalFile) error {
 		if target.SourceType == message.SourcePrivate {
 			input.CommandID = 69
 		}
-		if _, err := c.highwaySession.UploadExciting(input); err != nil {
+		if _, err := c.highwaySession.Upload(input); err != nil {
 			return errors.Wrap(err, "upload failed")
 		}
 	}
@@ -220,9 +220,9 @@ func (c *QQClient) buildPrivateFileUploadReqPacket(target message.Source, file *
 }
 
 // OfflineFilleHandleSvr.pb_ftn_CMD_REQ_APPLY_UPLOAD_V3-1700
-func decodePrivateFileUploadReq(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodePrivateFileUploadReq(_ *QQClient, pkt *network.Packet) (any, error) {
 	var rsp cmd0x346.C346RspBody
-	err := proto.Unmarshal(payload, &rsp)
+	err := proto.Unmarshal(pkt.Payload, &rsp)
 	if err != nil {
 		return nil, err
 	}

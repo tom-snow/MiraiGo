@@ -79,7 +79,7 @@ func (c *QQClient) GetGroupInfo(groupCode int64) (*GroupInfo, error) {
 // OidbSvc.0x88d_0
 func (c *QQClient) buildGroupInfoRequestPacket(groupCode int64) (uint16, []byte) {
 	body := &oidb.D88DReqBody{
-		AppId: proto.Uint32(c.version.AppId),
+		AppId: proto.Uint32(c.version().AppId),
 		ReqGroupInfo: []*oidb.ReqGroupInfo{
 			{
 				GroupCode: proto.Uint64(uint64(groupCode)),
@@ -181,9 +181,9 @@ func (c *QQClient) buildGroupSearchPacket(keyword string) (uint16, []byte) {
 }
 
 // SummaryCard.ReqSearch
-func decodeGroupSearchResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeGroupSearchResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	request := &jce.RequestPacket{}
-	request.ReadFrom(jce.NewJceReader(payload))
+	request.ReadFrom(jce.NewJceReader(pkt.Payload))
 	data := &jce.RequestDataVersion2{}
 	data.ReadFrom(jce.NewJceReader(request.SBuffer))
 	if len(data.Map["RespHead"]["SummaryCard.RespHead"]) > 20 {
@@ -219,9 +219,9 @@ func decodeGroupSearchResponse(_ *QQClient, _ *network.Packet, payload []byte) (
 }
 
 // OidbSvc.0x88d_0
-func decodeGroupInfoResponse(c *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeGroupInfoResponse(c *QQClient, pkt *network.Packet) (any, error) {
 	rsp := oidb.D88DRspBody{}
-	err := unpackOIDBPackage(payload, &rsp)
+	err := unpackOIDBPackage(pkt.Payload, &rsp)
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +250,7 @@ func decodeGroupInfoResponse(c *QQClient, _ *network.Packet, payload []byte) (an
 func (c *QQClient) uploadGroupHeadPortrait(groupCode int64, img []byte) error {
 	url := fmt.Sprintf("http://htdata3.qq.com/cgi-bin/httpconn?htcmd=0x6ff0072&ver=5520&ukey=%v&range=0&uin=%v&seq=23&groupuin=%v&filetype=3&imagetype=5&userdata=0&subcmd=1&subver=101&clip=0_0_0_0&filesize=%v",
 		c.getSKey(), c.Uin, groupCode, len(img))
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(img))
+	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(img))
 	req.Header["User-Agent"] = []string{"Dalvik/2.1.0 (Linux; U; Android 7.1.2; PCRT00 Build/N2G48H)"}
 	req.Header["Content-Type"] = []string{"multipart/form-data;boundary=****"}
 	rsp, err := http.DefaultClient.Do(req)

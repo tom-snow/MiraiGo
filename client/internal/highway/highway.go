@@ -1,11 +1,10 @@
 package highway
 
 import (
-	"crypto/md5"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,23 +21,51 @@ const (
 	_REQ_CMD_HEART_BREAK = "PicUp.Echo"
 )
 
+type Addr struct {
+	IP   uint32
+	Port int
+}
+
+func (a Addr) AsNetIP() net.IP {
+	return net.IPv4(byte(a.IP>>24), byte(a.IP>>16), byte(a.IP>>8), byte(a.IP))
+}
+
+func (a Addr) String() string {
+	return fmt.Sprintf("%v:%v", binary.UInt32ToIPV4Address(a.IP), a.Port)
+}
+
+func (a Addr) empty() bool {
+	return a.IP == 0 || a.Port == 0
+}
+
 type Session struct {
 	Uin        string
 	AppID      int32
 	SigSession []byte
 	SessionKey []byte
-	SsoAddr    []Addr
 
 	seq int32
+
+	addrMu  sync.Mutex
+	idx     int
+	SsoAddr []Addr
+
+	idleMu    sync.Mutex
+	idleCount int
+	idle      *idle
 }
 
 const highwayMaxResponseSize int32 = 1024 * 100 // 100k
 
 func (s *Session) AddrLength() int {
+	s.addrMu.Lock()
+	defer s.addrMu.Unlock()
 	return len(s.SsoAddr)
 }
 
 func (s *Session) AppendAddr(ip, port uint32) {
+	s.addrMu.Lock()
+	defer s.addrMu.Unlock()
 	addr := Addr{
 		IP:   ip,
 		Port: int(port),
@@ -46,174 +73,187 @@ func (s *Session) AppendAddr(ip, port uint32) {
 	s.SsoAddr = append(s.SsoAddr, addr)
 }
 
-func (s *Session) Upload(addr Addr, trans Transaction) error {
-	conn, err := net.DialTimeout("tcp", addr.String(), time.Second*3)
-	if err != nil {
-		return errors.Wrap(err, "connect error")
-	}
-	defer conn.Close()
-
-	const chunkSize = 8192 * 8
-	chunk := make([]byte, chunkSize)
-	offset := 0
-	reader := binary.NewNetworkReader(conn)
-	for {
-		chunk = chunk[:chunkSize]
-		rl, err := io.ReadFull(trans.Body, chunk)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			chunk = chunk[:rl]
-		}
-		ch := md5.Sum(chunk)
-		head, _ := proto.Marshal(&pb.ReqDataHighwayHead{
-			MsgBasehead: s.dataHighwayHead(_REQ_CMD_DATA, 4096, trans.CommandID, 2052),
-			MsgSeghead: &pb.SegHead{
-				Filesize:      trans.Size,
-				Dataoffset:    int64(offset),
-				Datalength:    int32(rl),
-				Serviceticket: trans.Ticket,
-				Md5:           ch[:],
-				FileMd5:       trans.Sum,
-			},
-			ReqExtendinfo: []byte{},
-		})
-		offset += rl
-		frame := newFrame(head, chunk)
-		_, err = frame.WriteTo(conn)
-		if err != nil {
-			return errors.Wrap(err, "write conn error")
-		}
-		rspHead, _, err := readResponse(reader)
-		if err != nil {
-			return errors.Wrap(err, "highway upload error")
-		}
-		if rspHead.ErrorCode != 0 {
-			return errors.New("upload failed")
-		}
-	}
-	return nil
-}
-
-func (s *Session) UploadExciting(trans Transaction) ([]byte, error) {
-	return s.retry(uploadExciting, &trans)
-}
-
-func uploadExciting(s *Session, addr Addr, trans *Transaction) ([]byte, error) {
-	url := fmt.Sprintf("http://%v/cgi-bin/httpconn?htcmd=0x6FF0087&Uin=%v", addr.String(), s.Uin)
-	var rspExt []byte
-	var offset int64
-	const chunkSize = 524288
-	chunk := make([]byte, chunkSize)
-	for {
-		chunk = chunk[:chunkSize]
-		rl, err := io.ReadFull(trans.Body, chunk)
-		if rl == 0 {
-			break
-		}
-		if err == io.ErrUnexpectedEOF {
-			chunk = chunk[:rl]
-		}
-		ch := md5.Sum(chunk)
-		head, _ := proto.Marshal(&pb.ReqDataHighwayHead{
-			MsgBasehead: s.dataHighwayHead(_REQ_CMD_DATA, 0, trans.CommandID, 0),
-			MsgSeghead: &pb.SegHead{
-				Filesize:      trans.Size,
-				Dataoffset:    offset,
-				Datalength:    int32(rl),
-				Serviceticket: trans.Ticket,
-				Md5:           ch[:],
-				FileMd5:       trans.Sum,
-			},
-			ReqExtendinfo: trans.Ext,
-		})
-		offset += int64(rl)
-		frame := newFrame(head, chunk)
-		req, _ := http.NewRequest("POST", url, &frame)
-		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Connection", "Keep-Alive")
-		req.Header.Set("User-Agent", "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)")
-		req.Header.Set("Pragma", "no-cache")
-		req.ContentLength = int64(len(head) + len(chunk) + 10)
-		rsp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, errors.Wrap(err, "request error")
-		}
-		body, _ := io.ReadAll(rsp.Body)
-		_ = rsp.Body.Close()
-		r := binary.NewReader(body)
-		r.ReadByte()
-		hl := r.ReadInt32()
-		_ = r.ReadInt32()
-		h := r.ReadBytes(int(hl))
-		rspHead := new(pb.RspDataHighwayHead)
-		if err = proto.Unmarshal(h, rspHead); err != nil {
-			return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
-		}
-		if rspHead.ErrorCode != 0 {
-			return nil, errors.Errorf("upload failed: %d", rspHead.ErrorCode)
-		}
-		if rspHead.RspExtendinfo != nil {
-			rspExt = rspHead.RspExtendinfo
-		}
-	}
-	return rspExt, nil
-}
-
 func (s *Session) nextSeq() int32 {
 	return atomic.AddInt32(&s.seq, 2)
 }
 
-func (s *Session) dataHighwayHead(cmd string, flag, cmdID, locale int32) *pb.DataHighwayHead {
-	return &pb.DataHighwayHead{
-		Version:   1,
-		Uin:       s.Uin,
-		Command:   cmd,
-		Seq:       s.nextSeq(),
-		Appid:     s.AppID,
-		Dataflag:  flag,
-		CommandId: cmdID,
-		LocaleId:  locale,
-	}
-}
-
 func (s *Session) sendHeartbreak(conn net.Conn) error {
 	head, _ := proto.Marshal(&pb.ReqDataHighwayHead{
-		MsgBasehead: s.dataHighwayHead(_REQ_CMD_HEART_BREAK, 4096, 0, 2052),
+		MsgBasehead: &pb.DataHighwayHead{
+			Version:   1,
+			Uin:       s.Uin,
+			Command:   _REQ_CMD_HEART_BREAK,
+			Seq:       s.nextSeq(),
+			Appid:     s.AppID,
+			Dataflag:  4096,
+			CommandId: 0,
+			LocaleId:  2052,
+		},
 	})
-	frame := newFrame(head, nil)
-	_, err := frame.WriteTo(conn)
+	buffers := frame(head, nil)
+	_, err := buffers.WriteTo(conn)
 	return err
 }
 
-func (s *Session) sendEcho(conn net.Conn) error {
-	err := s.sendHeartbreak(conn)
+func (s *Session) ping(pc *persistConn) error {
+	start := time.Now()
+	err := s.sendHeartbreak(pc.conn)
 	if err != nil {
 		return errors.Wrap(err, "echo error")
 	}
-	if _, _, err = readResponse(binary.NewNetworkReader(conn)); err != nil {
+	if _, err = readResponse(binary.NewNetworkReader(pc.conn)); err != nil {
 		return errors.Wrap(err, "echo error")
 	}
+	// update delay
+	pc.ping = time.Since(start).Milliseconds()
 	return nil
 }
 
-func readResponse(r *binary.NetworkReader) (*pb.RspDataHighwayHead, []byte, error) {
+func readResponse(r *binary.NetworkReader) (*pb.RspDataHighwayHead, error) {
 	_, err := r.ReadByte()
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to read byte")
+		return nil, errors.Wrap(err, "failed to read byte")
 	}
 	hl, _ := r.ReadInt32()
 	a2, _ := r.ReadInt32()
 	if hl > highwayMaxResponseSize || a2 > highwayMaxResponseSize {
-		return nil, nil, errors.Errorf("highway response invild. head size: %v body size: %v", hl, a2)
+		return nil, errors.Errorf("highway response invild. head size: %v body size: %v", hl, a2)
 	}
 	head, _ := r.ReadBytes(int(hl))
-	payload, _ := r.ReadBytes(int(a2))
+	_, _ = r.ReadBytes(int(a2)) // skip payload
 	_, _ = r.ReadByte()
 	rsp := new(pb.RspDataHighwayHead)
 	if err = proto.Unmarshal(head, rsp); err != nil {
-		return nil, nil, errors.Wrap(err, "failed to unmarshal protobuf message")
+		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
-	return rsp, payload, nil
+	return rsp, nil
+}
+
+type persistConn struct {
+	conn net.Conn
+	addr Addr
+	ping int64 // echo ping
+}
+
+const maxIdleConn = 7
+
+type idle struct {
+	pc   persistConn
+	next *idle
+}
+
+// getIdleConn ...
+func (s *Session) getIdleConn() persistConn {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+
+	// no idle
+	if s.idle == nil {
+		return persistConn{}
+	}
+
+	// switch the fastest idle conn
+	conn := s.idle.pc
+	s.idle = s.idle.next
+	s.idleCount--
+	if s.idleCount < 0 {
+		panic("idle count underflow")
+	}
+
+	return conn
+}
+
+func (s *Session) putIdleConn(pc persistConn) {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+
+	// check persistConn
+	if pc.conn == nil || pc.addr.empty() {
+		panic("put bad idle conn")
+	}
+
+	cur := &idle{pc: pc}
+	s.idleCount++
+	if s.idle == nil { // quick path
+		s.idle = cur
+		return
+	}
+
+	// insert between pre and succ
+	var pre, succ *idle
+	succ = s.idle
+	for succ != nil && succ.pc.ping < pc.ping { // keep idle list sorted by delay incremental
+		pre = succ
+		succ = succ.next
+	}
+	if pre != nil {
+		pre.next = cur
+	}
+	cur.next = succ
+
+	// remove the slowest idle conn if idle count greater than maxIdleConn
+	if s.idleCount > maxIdleConn {
+		for cur.next != nil {
+			pre = cur
+			cur = cur.next
+		}
+		pre.next = nil
+		s.idleCount--
+	}
+}
+
+func (s *Session) connect(addr Addr) (persistConn, error) {
+	conn, err := net.DialTimeout("tcp", addr.String(), time.Second*3)
+	if err != nil {
+		return persistConn{}, err
+	}
+	_ = conn.(*net.TCPConn).SetKeepAlive(true)
+
+	// close conn
+	runtime.SetFinalizer(conn, func(conn net.Conn) {
+		_ = conn.Close()
+	})
+
+	pc := persistConn{conn: conn, addr: addr}
+	if err = s.ping(&pc); err != nil {
+		return persistConn{}, err
+	}
+	return pc, nil
+}
+
+func (s *Session) nextAddr() Addr {
+	s.addrMu.Lock()
+	defer s.addrMu.Unlock()
+	addr := s.SsoAddr[s.idx]
+	s.idx = (s.idx + 1) % len(s.SsoAddr)
+	return addr
+}
+
+func (s *Session) selectConn() (pc persistConn, err error) {
+	for { // select from idle pc
+		pc = s.getIdleConn()
+		if pc.conn == nil {
+			// no idle connection
+			break
+		}
+
+		err = s.ping(&pc) // ping
+		if err == nil {
+			return
+		}
+	}
+
+	try := 0
+	for {
+		addr := s.nextAddr()
+		pc, err = s.connect(addr)
+		if err == nil {
+			break
+		}
+		try++
+		if try > 5 {
+			break
+		}
+	}
+	return
 }

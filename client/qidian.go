@@ -30,7 +30,7 @@ func (c *QQClient) getQiDianAddressDetailList() ([]*FriendInfo, error) {
 		SubCmd: proto.Uint32(33),
 		CrmCommonHead: &cmd0x6ff.C519CRMMsgHead{
 			KfUin:     proto.Uint64(uint64(c.QiDian.MasterUin)),
-			VerNo:     proto.Uint32(uint32(utils.ConvertSubVersionToInt(c.version.SortVersionName))),
+			VerNo:     proto.Uint32(uint32(utils.ConvertSubVersionToInt(c.version().SortVersionName))),
 			CrmSubCmd: proto.Uint32(33),
 			LaborUin:  proto.Uint64(uint64(c.Uin)),
 		},
@@ -68,21 +68,21 @@ func (c *QQClient) buildLoginExtraPacket() (uint16, []byte) {
 		SubCmd: proto.Uint32(69),
 		CrmCommonHead: &cmd0x3f6.C3F6CRMMsgHead{
 			CrmSubCmd:  proto.Uint32(69),
-			VerNo:      proto.Uint32(uint32(utils.ConvertSubVersionToInt(c.version.SortVersionName))),
+			VerNo:      proto.Uint32(uint32(utils.ConvertSubVersionToInt(c.version().SortVersionName))),
 			Clienttype: proto.Uint32(2),
 		},
 		SubcmdLoginProcessCompleteReqBody: &cmd0x3f6.QDUserLoginProcessCompleteReqBody{
 			Kfext:        proto.Uint64(uint64(c.Uin)),
-			Pubno:        proto.Some(c.version.AppId),
-			Buildno:      proto.Uint32(uint32(utils.ConvertSubVersionToInt(c.version.SortVersionName))),
+			Pubno:        proto.Some(c.version().AppId),
+			Buildno:      proto.Uint32(uint32(utils.ConvertSubVersionToInt(c.version().SortVersionName))),
 			TerminalType: proto.Uint32(2),
 			Status:       proto.Uint32(10),
 			LoginTime:    proto.Uint32(5),
-			HardwareInfo: proto.String(string(c.device.Model)),
-			SoftwareInfo: proto.String(string(c.device.Version.Release)),
-			Guid:         c.device.Guid,
-			AppName:      proto.Some(c.version.ApkId),
-			SubAppId:     proto.Some(c.version.AppId),
+			HardwareInfo: proto.String(string(c.Device().Model)),
+			SoftwareInfo: proto.String(string(c.Device().Version.Release)),
+			Guid:         c.Device().Guid,
+			AppName:      proto.Some(c.version().ApkId),
+			SubAppId:     proto.Some(c.version().AppId),
 		},
 	}
 	payload, _ := proto.Marshal(req)
@@ -129,7 +129,7 @@ func (c *QQClient) bigDataRequest(subCmd uint32, req proto.Message) ([]byte, err
 	tea := binary.NewTeaCipher(c.QiDian.bigDataReqSession.SessionKey)
 	body := tea.Encrypt(data)
 	url := fmt.Sprintf("http://%v/cgi-bin/httpconn", c.QiDian.bigDataReqAddrs[0])
-	httpReq, _ := http.NewRequest("POST", url, bytes.NewReader(binary.NewWriterF(func(w *binary.Writer) {
+	httpReq, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(binary.NewWriterF(func(w *binary.Writer) {
 		w.WriteByte(40)
 		w.WriteUInt32(uint32(len(head)))
 		w.WriteUInt32(uint32(len(body)))
@@ -155,9 +155,9 @@ func (c *QQClient) bigDataRequest(subCmd uint32, req proto.Message) ([]byte, err
 	return tea.Decrypt(payload), nil
 }
 
-func decodeLoginExtraResponse(c *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeLoginExtraResponse(c *QQClient, pkt *network.Packet) (any, error) {
 	rsp := cmd0x3f6.C3F6RspBody{}
-	if err := proto.Unmarshal(payload, &rsp); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if rsp.SubcmdLoginProcessCompleteRspBody == nil {
@@ -171,9 +171,9 @@ func decodeLoginExtraResponse(c *QQClient, _ *network.Packet, payload []byte) (a
 	return nil, nil
 }
 
-func decodeConnKeyResponse(c *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeConnKeyResponse(c *QQClient, pkt *network.Packet) (any, error) {
 	rsp := cmd0x6ff.C501RspBody{}
-	if err := proto.Unmarshal(payload, &rsp); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if c.QiDian == nil {

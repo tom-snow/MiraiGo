@@ -31,8 +31,8 @@ func (c *QQClient) buildFaceroamRequestPacket() (uint16, []byte) {
 	payload, _ := proto.Marshal(&faceroam.FaceroamReqBody{
 		Comm: &faceroam.PlatInfo{
 			Implat: proto.Int64(109),
-			Osver:  proto.String(string(c.device.Version.Release)),
-			Mqqver: proto.Some(c.version.SortVersionName),
+			Osver:  proto.String(string(c.Device().Version.Release)),
+			Mqqver: proto.Some(c.version().SortVersionName),
 		},
 		Uin:         proto.Uint64(uint64(c.Uin)),
 		SubCmd:      proto.Uint32(1),
@@ -41,9 +41,9 @@ func (c *QQClient) buildFaceroamRequestPacket() (uint16, []byte) {
 	return c.uniPacket("Faceroam.OpReq", payload)
 }
 
-func decodeFaceroamResponse(c *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeFaceroamResponse(c *QQClient, pkt *network.Packet) (any, error) {
 	rsp := faceroam.FaceroamRspBody{}
-	if err := proto.Unmarshal(payload, &rsp); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &rsp); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if rsp.RspUserInfo == nil {

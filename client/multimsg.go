@@ -51,9 +51,9 @@ func (c *QQClient) buildMultiApplyUpPacket(data, hash []byte, buType int32, grou
 }
 
 // MultiMsg.ApplyUp
-func decodeMultiApplyUpResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeMultiApplyUpResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	body := multimsg.MultiRspBody{}
-	if err := proto.Unmarshal(payload, &body); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &body); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if len(body.MultimsgApplyupRsp) == 0 {
@@ -91,9 +91,9 @@ func (c *QQClient) buildMultiApplyDownPacket(resID string) (uint16, []byte) {
 }
 
 // MultiMsg.ApplyDown
-func decodeMultiApplyDownResponse(_ *QQClient, _ *network.Packet, payload []byte) (any, error) {
+func decodeMultiApplyDownResponse(_ *QQClient, pkt *network.Packet) (any, error) {
 	body := multimsg.MultiRspBody{}
-	if err := proto.Unmarshal(payload, &body); err != nil {
+	if err := proto.Unmarshal(pkt.Payload, &body); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal protobuf message")
 	}
 	if len(body.MultimsgApplydownRsp) == 0 {
@@ -313,17 +313,13 @@ func (builder *ForwardMessageBuilder) Main(m *message.ForwardMessage) *message.F
 		Sum:       bodyHash[:],
 		Size:      int64(len(body)),
 	}
-	for i, ip := range rsp.Uint32UpIp {
-		addr := highway.Addr{IP: uint32(ip), Port: int(rsp.Uint32UpPort[i])}
-		err := c.highwaySession.Upload(addr, input)
-		if err != nil {
-			continue
-		}
-		return &message.ForwardElement{
-			FileName: filename,
-			Content:  content,
-			ResId:    rsp.MsgResid,
-		}
+	_, err = c.highwaySession.Upload(input)
+	if err != nil {
+		return nil
 	}
-	return nil
+	return &message.ForwardElement{
+		FileName: filename,
+		Content:  content,
+		ResId:    rsp.MsgResid,
+	}
 }
